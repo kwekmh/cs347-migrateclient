@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "migrateclient.h"
+#include "tcp_socket_options.h"
 
 void * StartDaemon(void *c) {
   Context *context = (Context *) c;
@@ -190,6 +191,56 @@ void * HandleClient(void *s) {
         std::string ip_address = ip_address_ss.str();
         int service_identifier = std::stoi(service_ident_ss.str());
 
+        pthread_mutex_t *mutex = GetMutex(context, service_identifier);
+        pthread_cond_t *cond = GetCond(context, service_identifier);
+
+        int old_sock;
+
+        pthread_mutex_lock(mutex);
+        old_sock = context->socks[service_identifier];
+        pthread_mutex_unlock(mutex);
+
+        uint32_t send_seq = GetSequenceNumber(old_sock, TCP_SEND_QUEUE);
+        uint32_t recv_seq = GetSequenceNumber(old_sock, TCP_RECV_QUEUE);
+
+        TcpSocketOptions sock_opts(old_sock);
+
+        std::cout << "Old socket info: " << sock_opts.GetString() << std::endl;
+
+        int new_sock;
+
+        context->socks_ready[service_identifier] = false;
+        // Send socket request to local service
+
+        std::cout << "Sending socket request" << std::endl;
+        SendSocketRequest(context, service_identifier);
+
+        pthread_mutex_lock(mutex);
+
+        while (!context->socks_ready[service_identifier]) {
+          pthread_cond_wait(cond, mutex);
+        }
+
+        context->socks_ready[service_identifier] = false;
+        new_sock = context->socks[service_identifier];
+
+        pthread_mutex_unlock(mutex);
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = inet_addr(ip_address.c_str());
+        addr.sin_port = htons(service_identifier);
+        if (connect(new_sock, (sockaddr *) &addr, sizeof(addr)) < 0) {
+          perror("Migration connect");
+        }
+        //RepairSocket(old_sock, service_identifier, ip_address, send_seq, recv_seq, sock_opts);
+
+        /*
+        TcpSocketOptions new_opts(new_sock);
+
+        std::cout << "New socket options: " << new_opts.GetString() << std::endl;
+        */
+        /*
         auto it = context->services.find(service_identifier);
         if (it != context->services.end()) {
           int fd = it->second->GetDescriptor();
@@ -197,10 +248,38 @@ void * HandleClient(void *s) {
         } else {
           std::cout << "Service not found!" << std::endl;
         }
+        */
       }
     }
   }
   return NULL;
+}
+
+void SendSocketRequest(Context *context, int service_identifier) {
+  auto it = context->services.find(service_identifier);
+  if (it != context->services.end()) {
+    std::cout << "Sending socket request to " << service_identifier << std::endl;
+    Service *service = it->second;
+    int sock = service->GetSocket();
+    std::stringstream msgstream;
+
+    msgstream << "SOCKET";
+
+    std::string msg = msgstream.str();
+
+    msgstream.str("");
+    msgstream.clear();
+
+    msgstream << msg.length() << " " << msg;
+
+    msg = msgstream.str();
+
+    if (send(sock, msg.c_str(), msg.length(), 0) < 0) {
+      perror("SendSocketRequest() send");
+    }
+  } else {
+    std::cout << "Service not found" << std::endl;
+  }
 }
 
 void * HandleLocalClient(void *s) {
@@ -288,6 +367,13 @@ void * HandleLocalClient(void *s) {
         }
         service->SetDescriptor(fd);
         pthread_mutex_unlock(&context->services_mutex);
+        pthread_mutex_t *mutex = GetMutex(context, service_identifier);
+        pthread_cond_t *cond = GetCond(context, service_identifier);
+        pthread_mutex_lock(mutex);
+        context->socks[service_identifier] = fd;
+        context->socks_ready[service_identifier] = true;
+        pthread_cond_signal(cond);
+        pthread_mutex_unlock(mutex);
       }
     }
   }
@@ -337,8 +423,11 @@ int AwaitSocketMessage(int sock) {
   return fd;
 }
 
-bool RepairSocket(int fd, int service_identifier, std::string ip_address) {
+bool RepairSocket(int fd, int service_identifier, std::string ip_address, uint32_t send_seq, uint32_t recv_seq, TcpSocketOptions &sock_opts) {
   std::cout << "Repairing socket: " << fd << " " << service_identifier << " " << ip_address << std::endl;
+
+  int aux_sendq = TCP_SEND_QUEUE;
+  int aux_recvq = TCP_RECV_QUEUE;
 
   int ret = TcpRepairOn(fd);
 
@@ -354,8 +443,39 @@ bool RepairSocket(int fd, int service_identifier, std::string ip_address) {
   addr.sin_port = htons(service_identifier);
   addr.sin_addr.s_addr = inet_addr(ip_address.c_str());
 
-
   connect(fd, (sockaddr *) &addr, sizeof(addr));
+
+  setsockopt(fd, SOL_TCP, TCP_REPAIR_QUEUE, &aux_sendq, sizeof(aux_sendq));
+  setsockopt(fd, SOL_TCP, TCP_QUEUE_SEQ, &send_seq, sizeof(send_seq));
+  setsockopt(fd, SOL_TCP, TCP_REPAIR_QUEUE, &aux_recvq, sizeof(aux_recvq));
+  setsockopt(fd, SOL_TCP, TCP_QUEUE_SEQ, &recv_seq, sizeof(recv_seq));
+
+  uint32_t mss_clamp = sock_opts.GetMssClamp();
+  uint32_t snd_wscale = sock_opts.GetSndWscale();
+  uint32_t rcv_wscale = sock_opts.GetRcvWscale();
+  uint32_t timestamp = sock_opts.GetTimestamp();
+
+  struct tcp_repair_opt opts[4];
+
+  // SACK
+  opts[0].opt_code = TCPOPT_SACK_PERMITTED;
+  opts[0].opt_val = 0;
+
+  // Window scales
+  opts[1].opt_code = TCPOPT_WINDOW;
+  opts[1].opt_val = snd_wscale + (rcv_wscale << 16);
+
+  // Timestamps
+  opts[2].opt_code = TCPOPT_TIMESTAMP;
+  opts[2].opt_val = 0;
+
+  // MSS clamp
+  opts[3].opt_code = TCPOPT_MAXSEG;
+  opts[3].opt_val = mss_clamp;
+
+  setsockopt(fd, SOL_TCP, TCP_REPAIR_OPTIONS, opts, 4 * sizeof(struct tcp_repair_opt));
+
+  setsockopt(fd, SOL_TCP, TCP_TIMESTAMP, &timestamp, sizeof(timestamp));
 
   ret = TcpRepairOff(fd);
 
@@ -363,6 +483,19 @@ bool RepairSocket(int fd, int service_identifier, std::string ip_address) {
     perror("RepairSocket() setsockopt off");
     return false;
   }
+
+  // START OF DEBUG CODE
+  sockaddr_in peer_addr;
+  socklen_t peer_addr_len = sizeof(peer_addr);
+
+  getpeername(fd, (sockaddr *) &peer_addr, &peer_addr_len);
+
+  char new_ip_str[INET_ADDRSTRLEN];
+
+  inet_ntop(AF_INET, &(peer_addr.sin_addr), new_ip_str, INET_ADDRSTRLEN);
+
+  std::cout << "New peer address: " << new_ip_str << std::endl;
+  // END OF DEBUG CODE
 
   std::cout << "Socket repaired" << std::endl;
   return true;
@@ -388,6 +521,58 @@ bool TcpRepairOff(int fd) {
   }
 }
 
+uint32_t GetSequenceNumber(int sock, int q_id) {
+  int aux_on = 1;
+  int aux_off = 0;
+
+  uint32_t seq_number;
+
+  socklen_t seq_number_len = sizeof(seq_number);
+
+  setsockopt(sock, SOL_TCP, TCP_REPAIR, &aux_on, sizeof(aux_on));
+
+  setsockopt(sock, SOL_TCP, TCP_REPAIR_QUEUE, &q_id, sizeof(q_id));
+
+  getsockopt(sock, SOL_TCP, TCP_QUEUE_SEQ, &seq_number, &seq_number_len);
+
+  setsockopt(sock, SOL_TCP, TCP_REPAIR, &aux_off, sizeof(aux_off));
+
+  return seq_number;
+}
+
+pthread_mutex_t * GetMutex(Context *context, int service_identifier) {
+  pthread_mutex_t *mutex_ptr;
+  pthread_mutex_lock(&context->sock_mutexes_mutex);
+  auto it = context->sock_mutexes.find(service_identifier);
+
+  if (it != context->sock_mutexes.end()) {
+    mutex_ptr = it->second;
+  } else {
+    mutex_ptr = new pthread_mutex_t;
+    pthread_mutex_init(mutex_ptr, NULL);
+    context->sock_mutexes[service_identifier] = mutex_ptr;
+  }
+  pthread_mutex_unlock(&context->sock_mutexes_mutex);
+  return mutex_ptr;
+}
+
+pthread_cond_t * GetCond(Context *context, int service_identifier) {
+  pthread_cond_t *cond_ptr;
+  pthread_mutex_lock(&context->sock_conds_mutex);
+  auto it = context->sock_conds.find(service_identifier);
+
+  if (it != context->sock_conds.end()) {
+    cond_ptr = it->second;
+  } else {
+    cond_ptr = new pthread_cond_t;
+    pthread_cond_init(cond_ptr, NULL);
+    context->sock_conds[service_identifier] = cond_ptr;
+  }
+  pthread_mutex_unlock(&context->sock_conds_mutex);
+
+  return cond_ptr;
+}
+
 void InitDaemon(Context *context) {
   pthread_t daemon_pthread;
   pthread_t local_daemon_pthread;
@@ -402,5 +587,7 @@ void InitDaemon(Context *context) {
 int main() {
   Context *context = new Context();
   pthread_mutex_init(&context->services_mutex, NULL);
+  pthread_mutex_init(&context->sock_mutexes_mutex, NULL);
+  pthread_mutex_init(&context->sock_conds_mutex, NULL);
   InitDaemon(context);
 }
